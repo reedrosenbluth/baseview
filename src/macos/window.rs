@@ -22,9 +22,18 @@ use raw_window_handle::{
 };
 
 use crate::{
-    Event, EventStatus, MouseCursor, Size, WindowHandler, WindowInfo, WindowOpenOptions,
+    Event, EventStatus, MouseCursor, Point, Size, WindowHandler, WindowInfo, WindowOpenOptions,
     WindowScalePolicy,
 };
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+    fn CGWarpMouseCursorPosition(point: cocoa::foundation::NSPoint) -> i32;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
+    fn CGMainDisplayID() -> u32;
+}
 
 use super::keyboard::KeyboardState;
 use super::view::{create_view, BASEVIEW_STATE_IVAR};
@@ -66,12 +75,38 @@ pub(super) struct WindowInner {
 
     #[cfg(feature = "opengl")]
     gl_context: Option<GlContext>,
+
+    /// Whether unbounded mouse movement mode is active
+    unbounded_mouse_movement: Cell<bool>,
+    /// The original cursor position when unbounded mode was enabled (in screen coordinates)
+    unbounded_origin: Cell<Option<NSPoint>>,
+    /// Whether to restore position when unbounded mode ends
+    restore_position_on_disable: Cell<bool>,
+    /// Cursor visibility state (tracked for balance)
+    cursor_visible: Cell<bool>,
 }
 
 impl WindowInner {
     pub(super) fn close(&self) {
         if self.open.get() {
             self.open.set(false);
+
+            // Clean up unbounded mouse movement state if active
+            if self.unbounded_mouse_movement.get() {
+                unsafe {
+                    CGAssociateMouseAndMouseCursorPosition(true);
+                }
+                self.unbounded_mouse_movement.set(false);
+            }
+
+            // Make sure cursor is visible
+            if !self.cursor_visible.get() {
+                unsafe {
+                    CGDisplayShowCursor(CGMainDisplayID());
+                }
+                self.cursor_visible.set(true);
+            }
+
             unsafe {
                 // Take back ownership of the NSView's Rc<WindowState>
                 let state_ptr: *const c_void = *(*self.ns_view).get_ivar(BASEVIEW_STATE_IVAR);
@@ -161,6 +196,11 @@ impl<'a> Window<'a> {
             gl_context: options
                 .gl_config
                 .map(|gl_config| Self::create_gl_context(None, ns_view, gl_config)),
+
+            unbounded_mouse_movement: Cell::new(false),
+            unbounded_origin: Cell::new(None),
+            restore_position_on_disable: Cell::new(false),
+            cursor_visible: Cell::new(true),
         };
 
         let window_handle = Self::init(window_inner, window_info, build);
@@ -236,6 +276,11 @@ impl<'a> Window<'a> {
             gl_context: options
                 .gl_config
                 .map(|gl_config| Self::create_gl_context(Some(ns_window), ns_view, gl_config)),
+
+            unbounded_mouse_movement: Cell::new(false),
+            unbounded_origin: Cell::new(None),
+            restore_position_on_disable: Cell::new(false),
+            cursor_visible: Cell::new(true),
         };
 
         let _ = Self::init(window_inner, window_info, build);
@@ -336,6 +381,103 @@ impl<'a> Window<'a> {
 
     pub fn set_mouse_cursor(&mut self, _mouse_cursor: MouseCursor) {
         todo!()
+    }
+
+    pub fn enable_unbounded_mouse_movement(&mut self, enable: bool, restore_position: bool) {
+        if enable && !self.inner.unbounded_mouse_movement.get() {
+            // Get current cursor position in screen coordinates
+            unsafe {
+                let mouse_location: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+                self.inner.unbounded_origin.set(Some(mouse_location));
+            }
+            self.inner.restore_position_on_disable.set(restore_position);
+
+            // Dissociate mouse and cursor - this freezes the cursor and makes events report deltas
+            unsafe {
+                CGAssociateMouseAndMouseCursorPosition(false);
+                CGDisplayHideCursor(CGMainDisplayID());
+            }
+            self.inner.unbounded_mouse_movement.set(true);
+            self.inner.cursor_visible.set(false);
+        } else if !enable && self.inner.unbounded_mouse_movement.get() {
+            // Re-associate mouse and cursor
+            unsafe {
+                CGAssociateMouseAndMouseCursorPosition(true);
+            }
+
+            // Restore cursor position if requested
+            if self.inner.restore_position_on_disable.get() {
+                if let Some(origin) = self.inner.unbounded_origin.get() {
+                    unsafe {
+                        // CGWarpMouseCursorPosition uses top-left origin, NSEvent uses bottom-left
+                        // Get screen height to convert
+                        let screen: id = msg_send![class!(NSScreen), mainScreen];
+                        let frame: NSRect = msg_send![screen, frame];
+                        let screen_height = frame.size.height;
+                        let warp_point = NSPoint::new(origin.x, screen_height - origin.y);
+                        CGWarpMouseCursorPosition(warp_point);
+                    }
+                }
+            }
+
+            // Show cursor
+            if !self.inner.cursor_visible.get() {
+                unsafe {
+                    CGDisplayShowCursor(CGMainDisplayID());
+                }
+                self.inner.cursor_visible.set(true);
+            }
+
+            self.inner.unbounded_mouse_movement.set(false);
+            self.inner.unbounded_origin.set(None);
+        }
+    }
+
+    pub fn is_unbounded_mouse_movement_enabled(&self) -> bool {
+        self.inner.unbounded_mouse_movement.get()
+    }
+
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        let currently_visible = self.inner.cursor_visible.get();
+        if visible && !currently_visible {
+            unsafe {
+                CGDisplayShowCursor(CGMainDisplayID());
+            }
+            self.inner.cursor_visible.set(true);
+        } else if !visible && currently_visible {
+            unsafe {
+                CGDisplayHideCursor(CGMainDisplayID());
+            }
+            self.inner.cursor_visible.set(false);
+        }
+    }
+
+    pub fn set_cursor_position(&mut self, position: Point) -> Result<(), ()> {
+        unsafe {
+            // Get the window's position on screen
+            let window: id = msg_send![self.inner.ns_view, window];
+            if window == nil {
+                return Err(());
+            }
+
+            // Convert position from view coordinates to screen coordinates
+            let local_point = NSPoint::new(position.x, position.y);
+            let window_point: NSPoint = msg_send![self.inner.ns_view, convertPoint:local_point toView:nil];
+            let screen_point: NSPoint = msg_send![window, convertPointToScreen:window_point];
+
+            // CGWarpMouseCursorPosition uses top-left origin
+            let screen: id = msg_send![class!(NSScreen), mainScreen];
+            let frame: NSRect = msg_send![screen, frame];
+            let screen_height = frame.size.height;
+            let warp_point = NSPoint::new(screen_point.x, screen_height - screen_point.y);
+
+            let result = CGWarpMouseCursorPosition(warp_point);
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
     }
 
     #[cfg(feature = "opengl")]

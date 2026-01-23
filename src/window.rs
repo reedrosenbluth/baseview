@@ -6,7 +6,7 @@ use raw_window_handle::{
 
 use crate::event::{Event, EventStatus};
 use crate::window_open_options::WindowOpenOptions;
-use crate::{MouseCursor, Size};
+use crate::{MouseCursor, Point, Size};
 
 #[cfg(target_os = "macos")]
 use crate::macos as platform;
@@ -108,6 +108,43 @@ impl<'a> Window<'a> {
 
     pub fn focus(&mut self) {
         self.window.focus()
+    }
+
+    /// Enable or disable unbounded mouse movement mode for drag operations.
+    ///
+    /// When enabled:
+    /// - The cursor is hidden
+    /// - The cursor position is frozen (on screen)
+    /// - Mouse movement events report relative deltas from the starting position
+    ///
+    /// When disabled:
+    /// - If `restore_position` was true when enabled, the cursor returns to its original position
+    /// - The cursor becomes visible again
+    ///
+    /// This is useful for implementing drag operations (like knobs/sliders) where you want
+    /// unlimited drag range without the cursor hitting screen edges.
+    pub fn enable_unbounded_mouse_movement(&mut self, enable: bool, restore_position: bool) {
+        self.window.enable_unbounded_mouse_movement(enable, restore_position);
+    }
+
+    /// Check if unbounded mouse movement is currently enabled.
+    pub fn is_unbounded_mouse_movement_enabled(&self) -> bool {
+        self.window.is_unbounded_mouse_movement_enabled()
+    }
+
+    /// Set the cursor visibility.
+    ///
+    /// Note: This is reference-counted internally on some platforms (macOS).
+    /// Each call to hide should be matched with a call to show.
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        self.window.set_cursor_visible(visible);
+    }
+
+    /// Set the cursor position in logical coordinates relative to the window.
+    ///
+    /// Returns `Ok(())` on success, `Err(())` if the operation failed.
+    pub fn set_cursor_position(&mut self, position: Point) -> Result<(), ()> {
+        self.window.set_cursor_position(position)
     }
 
     /// If provided, then an OpenGL context will be created for this window. You'll be able to

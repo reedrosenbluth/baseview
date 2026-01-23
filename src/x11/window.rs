@@ -20,8 +20,8 @@ use x11rb::wrapper::ConnectionExt as _;
 
 use super::XcbConnection;
 use crate::{
-    Event, MouseCursor, Size, WindowEvent, WindowHandler, WindowInfo, WindowOpenOptions,
-    WindowScalePolicy,
+    Event, MouseCursor, PhyPoint, Point, Size, WindowEvent, WindowHandler, WindowInfo,
+    WindowOpenOptions, WindowScalePolicy,
 };
 
 #[cfg(feature = "opengl")]
@@ -97,12 +97,27 @@ pub(crate) struct WindowInner {
     gl_context: Option<GlContext>,
 
     pub(crate) xcb_connection: XcbConnection,
-    window_id: XWindow,
+    pub(crate) window_id: XWindow,
     pub(crate) window_info: WindowInfo,
     visual_id: Visualid,
     mouse_cursor: Cell<MouseCursor>,
 
     pub(crate) close_requested: Cell<bool>,
+
+    /// Whether unbounded mouse movement mode is active
+    pub(crate) unbounded_mouse_movement: Cell<bool>,
+    /// The original cursor position when unbounded mode was enabled (in window coordinates)
+    pub(crate) unbounded_origin: Cell<Option<PhyPoint>>,
+    /// Whether to restore position when unbounded mode ends
+    pub(crate) restore_position_on_disable: Cell<bool>,
+    /// Expected warp event flag (to filter out self-generated events)
+    pub(crate) expecting_warp: Cell<bool>,
+    /// Accumulated delta during unbounded mode
+    pub(crate) unbounded_delta: Cell<(i32, i32)>,
+    /// Cursor visibility state
+    cursor_visible: Cell<bool>,
+    /// Invisible cursor ID (created lazily)
+    invisible_cursor: Cell<Option<u32>>,
 }
 
 pub struct Window<'a> {
@@ -279,6 +294,14 @@ impl<'a> Window<'a> {
 
             #[cfg(feature = "opengl")]
             gl_context,
+
+            unbounded_mouse_movement: Cell::new(false),
+            unbounded_origin: Cell::new(None),
+            restore_position_on_disable: Cell::new(false),
+            expecting_warp: Cell::new(false),
+            unbounded_delta: Cell::new((0, 0)),
+            cursor_visible: Cell::new(true),
+            invisible_cursor: Cell::new(None),
         };
 
         let mut window = crate::Window::new(Window { inner: &mut inner });
@@ -312,6 +335,173 @@ impl<'a> Window<'a> {
         }
 
         self.inner.mouse_cursor.set(mouse_cursor);
+    }
+
+    pub fn enable_unbounded_mouse_movement(&mut self, enable: bool, restore_position: bool) {
+        use x11rb::protocol::xproto::{
+            CreateCursorAux, CreatePixmapAux, Cursor, Pixmap as XPixmap,
+        };
+
+        if enable && !self.inner.unbounded_mouse_movement.get() {
+            // Get or create invisible cursor
+            let invisible_cursor = if let Some(cursor) = self.inner.invisible_cursor.get() {
+                cursor
+            } else {
+                // Create an invisible cursor using a 1x1 transparent pixmap
+                let conn = &self.inner.xcb_connection.conn;
+                let screen = self.inner.xcb_connection.screen();
+
+                // Create a 1x1 pixmap
+                let pixmap_id = conn.generate_id().unwrap_or(0);
+                let cursor_id = conn.generate_id().unwrap_or(0);
+
+                if pixmap_id != 0 && cursor_id != 0 {
+                    let _ = conn.create_pixmap(1, pixmap_id, screen.root, 1, 1);
+
+                    // Create cursor from the pixmap
+                    let _ = conn.create_cursor(
+                        cursor_id,
+                        pixmap_id,
+                        pixmap_id,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+
+                    let _ = conn.free_pixmap(pixmap_id);
+                    self.inner.invisible_cursor.set(Some(cursor_id));
+                    cursor_id
+                } else {
+                    0
+                }
+            };
+
+            // Store current position as origin
+            // We'll track position from the window info
+            let window_info = &self.inner.window_info;
+            let center_x = window_info.physical_size().width as i32 / 2;
+            let center_y = window_info.physical_size().height as i32 / 2;
+            self.inner.unbounded_origin.set(Some(PhyPoint::new(center_x, center_y)));
+            self.inner.restore_position_on_disable.set(restore_position);
+            self.inner.unbounded_delta.set((0, 0));
+
+            // Set invisible cursor
+            if invisible_cursor != 0 {
+                let _ = self.inner.xcb_connection.conn.change_window_attributes(
+                    self.inner.window_id,
+                    &ChangeWindowAttributesAux::new().cursor(invisible_cursor),
+                );
+            }
+            self.inner.cursor_visible.set(false);
+
+            // Warp cursor to center
+            let _ = self.inner.xcb_connection.conn.warp_pointer(
+                x11rb::NONE,
+                self.inner.window_id,
+                0,
+                0,
+                0,
+                0,
+                center_x as i16,
+                center_y as i16,
+            );
+            self.inner.expecting_warp.set(true);
+            let _ = self.inner.xcb_connection.conn.flush();
+
+            self.inner.unbounded_mouse_movement.set(true);
+        } else if !enable && self.inner.unbounded_mouse_movement.get() {
+            // Restore cursor position if requested
+            if self.inner.restore_position_on_disable.get() {
+                if let Some(origin) = self.inner.unbounded_origin.get() {
+                    let _ = self.inner.xcb_connection.conn.warp_pointer(
+                        x11rb::NONE,
+                        self.inner.window_id,
+                        0,
+                        0,
+                        0,
+                        0,
+                        origin.x as i16,
+                        origin.y as i16,
+                    );
+                    self.inner.expecting_warp.set(true);
+                }
+            }
+
+            // Restore cursor visibility
+            let cursor_xid = self.inner.xcb_connection.get_cursor(self.inner.mouse_cursor.get());
+            if let Ok(xid) = cursor_xid {
+                let _ = self.inner.xcb_connection.conn.change_window_attributes(
+                    self.inner.window_id,
+                    &ChangeWindowAttributesAux::new().cursor(xid),
+                );
+            }
+            self.inner.cursor_visible.set(true);
+
+            let _ = self.inner.xcb_connection.conn.flush();
+
+            self.inner.unbounded_mouse_movement.set(false);
+            self.inner.unbounded_origin.set(None);
+            self.inner.unbounded_delta.set((0, 0));
+        }
+    }
+
+    pub fn is_unbounded_mouse_movement_enabled(&self) -> bool {
+        self.inner.unbounded_mouse_movement.get()
+    }
+
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        if visible == self.inner.cursor_visible.get() {
+            return;
+        }
+
+        if visible {
+            // Restore normal cursor
+            let cursor_xid = self.inner.xcb_connection.get_cursor(self.inner.mouse_cursor.get());
+            if let Ok(xid) = cursor_xid {
+                let _ = self.inner.xcb_connection.conn.change_window_attributes(
+                    self.inner.window_id,
+                    &ChangeWindowAttributesAux::new().cursor(xid),
+                );
+            }
+        } else {
+            // Set invisible cursor
+            if let Some(invisible_cursor) = self.inner.invisible_cursor.get() {
+                let _ = self.inner.xcb_connection.conn.change_window_attributes(
+                    self.inner.window_id,
+                    &ChangeWindowAttributesAux::new().cursor(invisible_cursor),
+                );
+            }
+        }
+
+        let _ = self.inner.xcb_connection.conn.flush();
+        self.inner.cursor_visible.set(visible);
+    }
+
+    pub fn set_cursor_position(&mut self, position: Point) -> Result<(), ()> {
+        let physical = position.to_physical(&self.inner.window_info);
+
+        self.inner
+            .xcb_connection
+            .conn
+            .warp_pointer(
+                x11rb::NONE,
+                self.inner.window_id,
+                0,
+                0,
+                0,
+                0,
+                physical.x as i16,
+                physical.y as i16,
+            )
+            .map_err(|_| ())?;
+
+        self.inner.xcb_connection.conn.flush().map_err(|_| ())?;
+        Ok(())
     }
 
     pub fn close(&mut self) {

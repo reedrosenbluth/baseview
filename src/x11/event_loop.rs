@@ -8,6 +8,7 @@ use std::error::Error;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
+use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::protocol::Event as XEvent;
 
 pub(super) struct EventLoop {
@@ -173,8 +174,59 @@ impl EventLoop {
             // mouse
             ////
             XEvent::MotionNotify(event) => {
-                let physical_pos = PhyPoint::new(event.event_x as i32, event.event_y as i32);
-                let logical_pos = physical_pos.to_logical(&self.window.window_info);
+                let x = event.event_x as i32;
+                let y = event.event_y as i32;
+
+                // Handle unbounded mouse movement mode
+                let logical_pos = if self.window.unbounded_mouse_movement.get() {
+                    // Check if this is a warp event we generated
+                    if self.window.expecting_warp.get() {
+                        self.window.expecting_warp.set(false);
+                        return; // Skip this warp event
+                    }
+
+                    // Get the window center
+                    let center_x = self.window.window_info.physical_size().width as i32 / 2;
+                    let center_y = self.window.window_info.physical_size().height as i32 / 2;
+
+                    // Calculate delta from center
+                    let delta_x = x - center_x;
+                    let delta_y = y - center_y;
+
+                    // Only recenter if there was actual movement
+                    if delta_x != 0 || delta_y != 0 {
+                        // Accumulate delta
+                        let (acc_x, acc_y) = self.window.unbounded_delta.get();
+                        self.window.unbounded_delta.set((acc_x + delta_x, acc_y + delta_y));
+
+                        // Recenter cursor
+                        let _ = self.window.xcb_connection.conn.warp_pointer(
+                            x11rb::NONE,
+                            self.window.window_id,
+                            0,
+                            0,
+                            0,
+                            0,
+                            center_x as i16,
+                            center_y as i16,
+                        );
+                        self.window.expecting_warp.set(true);
+                        let _ = self.window.xcb_connection.conn.flush();
+                    }
+
+                    // Report position as origin + accumulated delta
+                    if let Some(origin) = self.window.unbounded_origin.get() {
+                        let (acc_x, acc_y) = self.window.unbounded_delta.get();
+                        let virtual_physical = PhyPoint::new(origin.x + acc_x, origin.y + acc_y);
+                        virtual_physical.to_logical(&self.window.window_info)
+                    } else {
+                        let physical_pos = PhyPoint::new(x, y);
+                        physical_pos.to_logical(&self.window.window_info)
+                    }
+                } else {
+                    let physical_pos = PhyPoint::new(x, y);
+                    physical_pos.to_logical(&self.window.window_info)
+                };
 
                 self.handler.on_event(
                     &mut crate::Window::new(Window { inner: &self.window }),
