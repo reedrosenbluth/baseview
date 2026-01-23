@@ -77,11 +77,13 @@ pub(super) struct WindowInner {
     gl_context: Option<GlContext>,
 
     /// Whether unbounded mouse movement mode is active
-    unbounded_mouse_movement: Cell<bool>,
+    pub(crate) unbounded_mouse_movement: Cell<bool>,
     /// The original cursor position when unbounded mode was enabled (in screen coordinates)
-    unbounded_origin: Cell<Option<NSPoint>>,
+    pub(crate) unbounded_origin: Cell<Option<NSPoint>>,
     /// Whether to restore position when unbounded mode ends
     restore_position_on_disable: Cell<bool>,
+    /// Accumulated delta during unbounded mode (in logical coordinates)
+    pub(crate) unbounded_delta: Cell<(f64, f64)>,
     /// Cursor visibility state (tracked for balance)
     cursor_visible: Cell<bool>,
 }
@@ -200,6 +202,7 @@ impl<'a> Window<'a> {
             unbounded_mouse_movement: Cell::new(false),
             unbounded_origin: Cell::new(None),
             restore_position_on_disable: Cell::new(false),
+            unbounded_delta: Cell::new((0.0, 0.0)),
             cursor_visible: Cell::new(true),
         };
 
@@ -280,6 +283,7 @@ impl<'a> Window<'a> {
             unbounded_mouse_movement: Cell::new(false),
             unbounded_origin: Cell::new(None),
             restore_position_on_disable: Cell::new(false),
+            unbounded_delta: Cell::new((0.0, 0.0)),
             cursor_visible: Cell::new(true),
         };
 
@@ -391,6 +395,7 @@ impl<'a> Window<'a> {
                 self.inner.unbounded_origin.set(Some(mouse_location));
             }
             self.inner.restore_position_on_disable.set(restore_position);
+            self.inner.unbounded_delta.set((0.0, 0.0));
 
             // Dissociate mouse and cursor - this freezes the cursor and makes events report deltas
             unsafe {
@@ -430,6 +435,7 @@ impl<'a> Window<'a> {
 
             self.inner.unbounded_mouse_movement.set(false);
             self.inner.unbounded_origin.set(None);
+            self.inner.unbounded_delta.set((0.0, 0.0));
         }
     }
 
