@@ -1,20 +1,21 @@
 use winapi::shared::guiddef::GUID;
 use winapi::shared::minwindef::{ATOM, FALSE, LOWORD, LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HWND, RECT};
+use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::combaseapi::CoCreateGuid;
 use winapi::um::ole2::{OleInitialize, RegisterDragDrop, RevokeDragDrop};
 use winapi::um::oleidl::LPDROPTARGET;
 use winapi::um::winuser::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetDpiForWindow, GetFocus, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW,
-    RegisterClassW, ReleaseCapture, SetCapture, SetCursor, SetFocus, SetProcessDpiAwarenessContext,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, TrackMouseEvent, TranslateMessage, UnregisterClassW,
-    CS_OWNDC, GET_XBUTTON_WPARAM, GWLP_USERDATA, HTCLIENT, IDC_ARROW, MSG, SWP_NOMOVE,
-    SWP_NOZORDER, TRACKMOUSEEVENT, WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DPICHANGED,
-    WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSELEAVE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CAPTION, WS_CHILD,
+    AdjustWindowRectEx, ClientToScreen, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, GetCursorPos, GetDpiForWindow, GetFocus, GetMessageW, GetWindowLongPtrW,
+    GetWindowRect, LoadCursorW, PostMessageW, RegisterClassW, ReleaseCapture, SetCapture,
+    SetCursor, SetCursorPos, SetFocus, SetProcessDpiAwarenessContext, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowCursor, TrackMouseEvent, TranslateMessage, UnregisterClassW, CS_OWNDC,
+    GET_XBUTTON_WPARAM, GWLP_USERDATA, HTCLIENT, IDC_ARROW, MSG, SWP_NOMOVE, SWP_NOZORDER,
+    TRACKMOUSEEVENT, WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DPICHANGED, WM_INPUTLANGCHANGE,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSELEAVE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_TIMER, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CAPTION, WS_CHILD,
     WS_CLIPSIBLINGS, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUPWINDOW, WS_SIZEBOX, WS_VISIBLE,
     XBUTTON1, XBUTTON2,
 };
@@ -34,8 +35,8 @@ use raw_window_handle::{
 const BV_WINDOW_MUST_CLOSE: UINT = WM_USER + 1;
 
 use crate::{
-    Event, MouseButton, MouseCursor, MouseEvent, PhyPoint, PhySize, ScrollDelta, Size, WindowEvent,
-    WindowHandler, WindowInfo, WindowOpenOptions, WindowScalePolicy,
+    Event, MouseButton, MouseCursor, MouseEvent, PhyPoint, PhySize, Point, ScrollDelta, Size,
+    WindowEvent, WindowHandler, WindowInfo, WindowOpenOptions, WindowScalePolicy,
 };
 
 use super::cursor::cursor_to_lpcwstr;
@@ -199,8 +200,56 @@ unsafe fn wnd_proc_inner(
             let x = (lparam & 0xFFFF) as i16 as i32;
             let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
 
-            let physical_pos = PhyPoint { x, y };
-            let logical_pos = physical_pos.to_logical(&window_state.window_info.borrow());
+            // Handle unbounded mouse movement mode
+            let logical_pos = if window_state.unbounded_mouse_movement.get() {
+                // Check if this is a synthetic event we generated
+                if window_state.expecting_synthetic_move.get() {
+                    window_state.expecting_synthetic_move.set(false);
+                    return Some(0); // Skip this synthetic event
+                }
+
+                // Get the window center in client coordinates
+                let window_info = window_state.window_info.borrow();
+                let center_x = window_info.physical_size().width as i32 / 2;
+                let center_y = window_info.physical_size().height as i32 / 2;
+
+                // Calculate delta from center
+                let delta_x = x - center_x;
+                let delta_y = y - center_y;
+
+                // Only recenter if there was actual movement
+                if delta_x != 0 || delta_y != 0 {
+                    // Accumulate delta
+                    let (acc_x, acc_y) = window_state.unbounded_delta.get();
+                    window_state.unbounded_delta.set((acc_x + delta_x, acc_y + delta_y));
+
+                    // Recenter cursor
+                    let mut center_screen = POINT { x: center_x, y: center_y };
+                    ClientToScreen(hwnd, &mut center_screen);
+                    window_state.expecting_synthetic_move.set(true);
+                    SetCursorPos(center_screen.x, center_screen.y);
+                }
+
+                // Report position as origin + accumulated delta
+                if let Some(origin) = window_state.unbounded_origin.get() {
+                    let (acc_x, acc_y) = window_state.unbounded_delta.get();
+                    // Convert origin (screen coords) to client coords for proper reporting
+                    let mut origin_client = origin;
+                    // We need to compute logical position from the virtual position
+                    let virtual_physical = PhyPoint {
+                        x: origin_client.x + acc_x,
+                        y: origin_client.y + acc_y,
+                    };
+                    virtual_physical.to_logical(&window_info)
+                } else {
+                    let physical_pos = PhyPoint { x, y };
+                    physical_pos.to_logical(&window_info)
+                }
+            } else {
+                let physical_pos = PhyPoint { x, y };
+                physical_pos.to_logical(&window_state.window_info.borrow())
+            };
+
             let move_event = Event::Mouse(MouseEvent::CursorMoved {
                 position: logical_pos,
                 modifiers: window_state
@@ -516,6 +565,19 @@ pub(super) struct WindowState {
 
     #[cfg(feature = "opengl")]
     pub gl_context: Option<GlContext>,
+
+    /// Whether unbounded mouse movement mode is active
+    unbounded_mouse_movement: Cell<bool>,
+    /// The original cursor position when unbounded mode was enabled (screen coordinates)
+    unbounded_origin: Cell<Option<POINT>>,
+    /// Whether to restore position when unbounded mode ends
+    restore_position_on_disable: Cell<bool>,
+    /// Expected synthetic mouse move event flag (to filter out self-generated events)
+    expecting_synthetic_move: Cell<bool>,
+    /// Accumulated delta during unbounded mode
+    unbounded_delta: Cell<(i32, i32)>,
+    /// Cursor visibility count (Windows uses reference counting)
+    cursor_visible: Cell<bool>,
 }
 
 impl WindowState {
@@ -718,6 +780,13 @@ impl Window<'_> {
 
                 #[cfg(feature = "opengl")]
                 gl_context,
+
+                unbounded_mouse_movement: Cell::new(false),
+                unbounded_origin: Cell::new(None),
+                restore_position_on_disable: Cell::new(false),
+                expecting_synthetic_move: Cell::new(false),
+                unbounded_delta: Cell::new((0, 0)),
+                cursor_visible: Cell::new(true),
             });
 
             let handler = {
@@ -817,6 +886,97 @@ impl Window<'_> {
         unsafe {
             let cursor = LoadCursorW(null_mut(), cursor_to_lpcwstr(mouse_cursor));
             SetCursor(cursor);
+        }
+    }
+
+    pub fn enable_unbounded_mouse_movement(&mut self, enable: bool, restore_position: bool) {
+        if enable && !self.state.unbounded_mouse_movement.get() {
+            unsafe {
+                // Get current cursor position
+                let mut cursor_pos = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut cursor_pos);
+
+                // Store the original position (in screen coordinates)
+                self.state.unbounded_origin.set(Some(cursor_pos));
+                self.state.restore_position_on_disable.set(restore_position);
+                self.state.unbounded_delta.set((0, 0));
+
+                // Hide cursor
+                ShowCursor(FALSE);
+                self.state.cursor_visible.set(false);
+
+                // Move cursor to window center to start
+                let window_info = self.state.window_info.borrow();
+                let center_x = window_info.physical_size().width as i32 / 2;
+                let center_y = window_info.physical_size().height as i32 / 2;
+                let mut center_screen = POINT { x: center_x, y: center_y };
+                ClientToScreen(self.state.hwnd, &mut center_screen);
+                self.state.expecting_synthetic_move.set(true);
+                SetCursorPos(center_screen.x, center_screen.y);
+
+                // Convert screen position to client coordinates for origin tracking
+                // Store as the starting position within the client area
+                let mut client_origin = cursor_pos;
+                // We'll keep screen coords for restoration but use client-relative for deltas
+            }
+
+            self.state.unbounded_mouse_movement.set(true);
+        } else if !enable && self.state.unbounded_mouse_movement.get() {
+            // Restore cursor position if requested
+            if self.state.restore_position_on_disable.get() {
+                if let Some(origin) = self.state.unbounded_origin.get() {
+                    unsafe {
+                        self.state.expecting_synthetic_move.set(true);
+                        SetCursorPos(origin.x, origin.y);
+                    }
+                }
+            }
+
+            // Show cursor
+            if !self.state.cursor_visible.get() {
+                unsafe {
+                    ShowCursor(winapi::shared::minwindef::TRUE);
+                }
+                self.state.cursor_visible.set(true);
+            }
+
+            self.state.unbounded_mouse_movement.set(false);
+            self.state.unbounded_origin.set(None);
+            self.state.unbounded_delta.set((0, 0));
+        }
+    }
+
+    pub fn is_unbounded_mouse_movement_enabled(&self) -> bool {
+        self.state.unbounded_mouse_movement.get()
+    }
+
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        let currently_visible = self.state.cursor_visible.get();
+        if visible && !currently_visible {
+            unsafe {
+                ShowCursor(winapi::shared::minwindef::TRUE);
+            }
+            self.state.cursor_visible.set(true);
+        } else if !visible && currently_visible {
+            unsafe {
+                ShowCursor(FALSE);
+            }
+            self.state.cursor_visible.set(false);
+        }
+    }
+
+    pub fn set_cursor_position(&mut self, position: Point) -> Result<(), ()> {
+        unsafe {
+            let window_info = self.state.window_info.borrow();
+            let physical = position.to_physical(&window_info);
+            let mut screen_point = POINT { x: physical.x, y: physical.y };
+            ClientToScreen(self.state.hwnd, &mut screen_point);
+
+            if SetCursorPos(screen_point.x, screen_point.y) != 0 {
+                Ok(())
+            } else {
+                Err(())
+            }
         }
     }
 
