@@ -468,7 +468,8 @@ impl<'a> Window<'a> {
 
             // Convert position from view coordinates to screen coordinates
             let local_point = NSPoint::new(position.x, position.y);
-            let window_point: NSPoint = msg_send![self.inner.ns_view, convertPoint:local_point toView:nil];
+            let window_point: NSPoint =
+                msg_send![self.inner.ns_view, convertPoint:local_point toView:nil];
             let screen_point: NSPoint = msg_send![window, convertPointToScreen:window_point];
 
             // CGWarpMouseCursorPosition uses top-left origin

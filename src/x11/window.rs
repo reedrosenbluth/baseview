@@ -359,19 +359,8 @@ impl<'a> Window<'a> {
                     let _ = conn.create_pixmap(1, pixmap_id, screen.root, 1, 1);
 
                     // Create cursor from the pixmap
-                    let _ = conn.create_cursor(
-                        cursor_id,
-                        pixmap_id,
-                        pixmap_id,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                    );
+                    let _ =
+                        conn.create_cursor(cursor_id, pixmap_id, pixmap_id, 0, 0, 0, 0, 0, 0, 0, 0);
 
                     let _ = conn.free_pixmap(pixmap_id);
                     self.inner.invisible_cursor.set(Some(cursor_id));

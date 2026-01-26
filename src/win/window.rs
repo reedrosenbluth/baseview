@@ -237,10 +237,8 @@ unsafe fn wnd_proc_inner(
                     // Convert origin (screen coords) to client coords for proper reporting
                     let mut origin_client = origin;
                     // We need to compute logical position from the virtual position
-                    let virtual_physical = PhyPoint {
-                        x: origin_client.x + acc_x,
-                        y: origin_client.y + acc_y,
-                    };
+                    let virtual_physical =
+                        PhyPoint { x: origin_client.x + acc_x, y: origin_client.y + acc_y };
                     virtual_physical.to_logical(&window_info)
                 } else {
                     let physical_pos = PhyPoint { x, y };
