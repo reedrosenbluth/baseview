@@ -431,10 +431,7 @@ extern "C" fn mouse_moved(this: &Object, _sel: Sel, event: id) {
 
         // Calculate virtual position: origin + accumulated delta
         // Note: deltaY is positive when moving up, but in view coordinates Y increases downward
-        Point {
-            x: origin_point.x + new_acc_x,
-            y: origin_point.y + new_acc_y,
-        }
+        Point { x: origin_point.x + new_acc_x, y: origin_point.y + new_acc_y }
     } else {
         // Normal mode: use absolute position
         let point: NSPoint = unsafe {
