@@ -393,45 +393,26 @@ extern "C" fn mouse_moved(this: &Object, _sel: Sel, event: id) {
 
     // Check if we're in unbounded mouse movement mode
     let position = if state.window_inner.unbounded_mouse_movement.get() {
-        // In unbounded mode, use deltaX/deltaY to accumulate movement
-        let (delta_x, delta_y) = unsafe {
-            let dx: f64 = msg_send![event, deltaX];
-            let dy: f64 = msg_send![event, deltaY];
-            (dx, dy)
-        };
+        // Delta-based unbounded movement.
+        //
+        // The cursor is frozen via CGAssociateMouseAndMouseCursorPosition(false) for the
+        // entire unbounded mode, so:
+        // - No edge warps needed (cursor never moves, can't hit screen edges)
+        // - Deltas work perfectly (no warps to break them)
+        // - Position = origin_in_view + accumulated_deltas
+        let delta_x = unsafe { NSEvent::deltaX(event) };
+        let delta_y = unsafe { NSEvent::deltaY(event) };
 
-        // Accumulate the delta
-        let (acc_x, acc_y) = state.window_inner.unbounded_delta.get();
+        let (acc_x, acc_y) = state.window_inner.unbounded_offset.get();
         let new_acc_x = acc_x + delta_x;
         let new_acc_y = acc_y + delta_y;
-        state.window_inner.unbounded_delta.set((new_acc_x, new_acc_y));
+        state.window_inner.unbounded_offset.set((new_acc_x, new_acc_y));
 
-        // Get the original position in window coordinates where unbounded mode started
-        // We need to convert the screen coordinates stored in unbounded_origin to window coordinates
-        let origin_point: NSPoint = unsafe {
-            if let Some(screen_origin) = state.window_inner.unbounded_origin.get() {
-                // Convert from screen coordinates to window coordinates
-                let window: id = msg_send![this, window];
-                if window != nil {
-                    let window_frame: NSRect = msg_send![window, frame];
-                    // NSEvent mouseLocation is in screen coordinates (bottom-left origin)
-                    // Window frame origin is also bottom-left
-                    let window_x = screen_origin.x - window_frame.origin.x;
-                    let window_y = screen_origin.y - window_frame.origin.y;
-                    // Convert to view coordinates (flipped, so subtract from height)
-                    let view_bounds: NSRect = msg_send![this, bounds];
-                    NSPoint::new(window_x, view_bounds.size.height - window_y)
-                } else {
-                    NSPoint::new(0.0, 0.0)
-                }
-            } else {
-                NSPoint::new(0.0, 0.0)
-            }
-        };
-
-        // Calculate virtual position: origin + accumulated delta
-        // Note: deltaY is positive when moving up, but in view coordinates Y increases downward
-        Point { x: origin_point.x + new_acc_x, y: origin_point.y + new_acc_y }
+        let (origin_x, origin_y) = state.window_inner.unbounded_origin_view.get();
+        Point {
+            x: origin_x + new_acc_x,
+            y: origin_y + new_acc_y,
+        }
     } else {
         // Normal mode: use absolute position
         let point: NSPoint = unsafe {

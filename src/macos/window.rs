@@ -28,11 +28,8 @@ use crate::{
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
-    fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
     fn CGWarpMouseCursorPosition(point: cocoa::foundation::NSPoint) -> i32;
-    fn CGDisplayHideCursor(display: u32) -> i32;
-    fn CGDisplayShowCursor(display: u32) -> i32;
-    fn CGMainDisplayID() -> u32;
+    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
 }
 
 use super::keyboard::KeyboardState;
@@ -81,9 +78,12 @@ pub(super) struct WindowInner {
     /// The original cursor position when unbounded mode was enabled (in screen coordinates)
     pub(crate) unbounded_origin: Cell<Option<NSPoint>>,
     /// Whether to restore position when unbounded mode ends
-    restore_position_on_disable: Cell<bool>,
-    /// Accumulated delta during unbounded mode (in logical coordinates)
-    pub(crate) unbounded_delta: Cell<(f64, f64)>,
+    pub(crate) restore_position_on_disable: Cell<bool>,
+    /// The cursor position in view coordinates when unbounded mode was enabled.
+    /// Used as the base point for delta accumulation.
+    pub(crate) unbounded_origin_view: Cell<(f64, f64)>,
+    /// Accumulated delta during unbounded mode (in view coordinate deltas).
+    pub(crate) unbounded_offset: Cell<(f64, f64)>,
     /// Cursor visibility state (tracked for balance)
     cursor_visible: Cell<bool>,
 }
@@ -95,16 +95,13 @@ impl WindowInner {
 
             // Clean up unbounded mouse movement state if active
             if self.unbounded_mouse_movement.get() {
-                unsafe {
-                    CGAssociateMouseAndMouseCursorPosition(true);
-                }
                 self.unbounded_mouse_movement.set(false);
             }
 
             // Make sure cursor is visible
             if !self.cursor_visible.get() {
                 unsafe {
-                    CGDisplayShowCursor(CGMainDisplayID());
+                    let _: () = msg_send![class!(NSCursor), unhide];
                 }
                 self.cursor_visible.set(true);
             }
@@ -202,7 +199,8 @@ impl<'a> Window<'a> {
             unbounded_mouse_movement: Cell::new(false),
             unbounded_origin: Cell::new(None),
             restore_position_on_disable: Cell::new(false),
-            unbounded_delta: Cell::new((0.0, 0.0)),
+            unbounded_origin_view: Cell::new((0.0, 0.0)),
+            unbounded_offset: Cell::new((0.0, 0.0)),
             cursor_visible: Cell::new(true),
         };
 
@@ -283,7 +281,8 @@ impl<'a> Window<'a> {
             unbounded_mouse_movement: Cell::new(false),
             unbounded_origin: Cell::new(None),
             restore_position_on_disable: Cell::new(false),
-            unbounded_delta: Cell::new((0.0, 0.0)),
+            unbounded_origin_view: Cell::new((0.0, 0.0)),
+            unbounded_offset: Cell::new((0.0, 0.0)),
             cursor_visible: Cell::new(true),
         };
 
@@ -387,55 +386,70 @@ impl<'a> Window<'a> {
         todo!()
     }
 
+    /// Enable or disable unbounded mouse movement.
+    ///
+    /// When enabled, this hides the cursor and freezes its position using
+    /// `CGAssociateMouseAndMouseCursorPosition`. Mouse events report deltas
+    /// accumulated from the starting position, allowing unlimited movement
+    /// without screen edge constraints.
     pub fn enable_unbounded_mouse_movement(&mut self, enable: bool, restore_position: bool) {
         if enable && !self.inner.unbounded_mouse_movement.get() {
-            // Get current cursor position in screen coordinates
             unsafe {
+                // Store the original cursor position in screen coords for restore warp
                 let mouse_location: NSPoint = msg_send![class!(NSEvent), mouseLocation];
                 self.inner.unbounded_origin.set(Some(mouse_location));
-            }
-            self.inner.restore_position_on_disable.set(restore_position);
-            self.inner.unbounded_delta.set((0.0, 0.0));
 
-            // Dissociate mouse and cursor - this freezes the cursor and makes events report deltas
-            unsafe {
-                CGAssociateMouseAndMouseCursorPosition(false);
-                CGDisplayHideCursor(CGMainDisplayID());
+                // Compute and store the origin in view coordinates for delta accumulation
+                let window: id = msg_send![self.inner.ns_view, window];
+                if window != nil {
+                    let window_point: NSPoint =
+                        msg_send![window, convertPointFromScreen:mouse_location];
+                    let view_point: NSPoint =
+                        msg_send![self.inner.ns_view, convertPoint:window_point fromView:nil];
+                    self.inner.unbounded_origin_view.set((view_point.x, view_point.y));
+                }
+
+                // Hide cursor and freeze its position for the entire unbounded mode.
+                // By keeping CGAssociate false the whole time, the cursor never moves,
+                // so no edge warps are needed. Deltas work perfectly since there are
+                // no warps to break them.
+                let _: () = msg_send![class!(NSCursor), hide];
+                CGAssociateMouseAndMouseCursorPosition(0); // false - freeze cursor
             }
+
+            self.inner.restore_position_on_disable.set(restore_position);
+            self.inner.unbounded_offset.set((0.0, 0.0));
             self.inner.unbounded_mouse_movement.set(true);
             self.inner.cursor_visible.set(false);
         } else if !enable && self.inner.unbounded_mouse_movement.get() {
-            // Re-associate mouse and cursor
             unsafe {
-                CGAssociateMouseAndMouseCursorPosition(true);
-            }
-
-            // Restore cursor position if requested
-            if self.inner.restore_position_on_disable.get() {
-                if let Some(origin) = self.inner.unbounded_origin.get() {
-                    unsafe {
-                        // CGWarpMouseCursorPosition uses top-left origin, NSEvent uses bottom-left
-                        // Get screen height to convert
+                // Warp to origin while still disassociated (no event suppression delay).
+                // Then reassociate. This is the key: warp BEFORE reassociate avoids the
+                // ~0.25s cursor suppression that CGWarp normally causes.
+                if self.inner.restore_position_on_disable.get() {
+                    if let Some(origin) = self.inner.unbounded_origin.get() {
                         let screen: id = msg_send![class!(NSScreen), mainScreen];
                         let frame: NSRect = msg_send![screen, frame];
                         let screen_height = frame.size.height;
-                        let warp_point = NSPoint::new(origin.x, screen_height - origin.y);
-                        CGWarpMouseCursorPosition(warp_point);
+                        // CGWarpMouseCursorPosition uses top-left origin
+                        let point = NSPoint::new(origin.x, screen_height - origin.y);
+                        CGWarpMouseCursorPosition(point);
                     }
                 }
-            }
 
-            // Show cursor
-            if !self.inner.cursor_visible.get() {
-                unsafe {
-                    CGDisplayShowCursor(CGMainDisplayID());
+                // Reassociate cursor with mouse movement
+                CGAssociateMouseAndMouseCursorPosition(1); // true - unfreeze cursor
+
+                // Show cursor
+                if !self.inner.cursor_visible.get() {
+                    let _: () = msg_send![class!(NSCursor), unhide];
+                    self.inner.cursor_visible.set(true);
                 }
-                self.inner.cursor_visible.set(true);
             }
 
             self.inner.unbounded_mouse_movement.set(false);
             self.inner.unbounded_origin.set(None);
-            self.inner.unbounded_delta.set((0.0, 0.0));
+            self.inner.unbounded_offset.set((0.0, 0.0));
         }
     }
 
@@ -447,12 +461,12 @@ impl<'a> Window<'a> {
         let currently_visible = self.inner.cursor_visible.get();
         if visible && !currently_visible {
             unsafe {
-                CGDisplayShowCursor(CGMainDisplayID());
+                let _: () = msg_send![class!(NSCursor), unhide];
             }
             self.inner.cursor_visible.set(true);
         } else if !visible && currently_visible {
             unsafe {
-                CGDisplayHideCursor(CGMainDisplayID());
+                let _: () = msg_send![class!(NSCursor), hide];
             }
             self.inner.cursor_visible.set(false);
         }
